@@ -356,6 +356,14 @@ class PymunkLunarLanderDemo:
         rng: np.random.Generator | None = None,
         randomize_initial_state: bool = False,
         solver_iterations: int = 6 * 30,
+        deterministic: bool = False,
+        enable_wind: bool = False,
+        wind_power: float = 15.0,
+        turbulence_power: float = 1.5,
+        main_engine_power: float = 13.0,
+        side_engine_power: float = 0.6,
+        initial_random: float = 1000.0,
+        dispersion_scale: float = 1.0,
     ):
         """Create a seeded Pymunk LunarLander demonstration world."""
         self.world_width = VIEWPORT_WIDTH / SCALE
@@ -385,6 +393,25 @@ class PymunkLunarLanderDemo:
             LEFT_LEG_COLLISION_TYPE: 0,
             RIGHT_LEG_COLLISION_TYPE: 0,
         }
+        self.deterministic = deterministic
+        self.enable_wind = enable_wind
+        self.wind_power = wind_power
+        self.turbulence_power = turbulence_power
+        self.main_engine_power = main_engine_power
+        self.side_engine_power = side_engine_power
+        self.initial_random = initial_random
+        
+        # by zeroing out the dispersion scale in deterministic mode, we successfully
+        # disable its physical effect on the engines while still allowing the rng
+        # to be queried (see `step()` method). this keeps the underlying sequence of
+        # pseudo-random numbers perfectly aligned with the stochastic mode, ensuring
+        # the terrain generation (which relies on rng) remains unaffected.
+        self.dispersion_scale = dispersion_scale if not deterministic else 0.0
+        
+        # similarly, fixing the wind index at 0.0 when deterministic guarantees that
+        # the sinusoidal wind equations return a constant 0, rather than sampling a
+        # random phase offset.
+        self.wind_idx = rng.uniform(-9999, 9999) if not deterministic else 0.0
 
         self.lander_body = _create_lander_body(
             self.space,
@@ -410,10 +437,17 @@ class PymunkLunarLanderDemo:
 
     def _randomize_initial_state(self, rng: np.random.Generator) -> None:
         """Apply Box2D-style initial random force and small angle perturbation."""
-        force = pymunk.Vec2d(
-            float(rng.uniform(-INITIAL_RANDOM, INITIAL_RANDOM)),
-            float(rng.uniform(-INITIAL_RANDOM, INITIAL_RANDOM)),
-        )
+        if self.deterministic:
+            # in deterministic mode, we apply a fixed symmetric force instead of
+            # querying the rng. we avoid querying the rng altogether here because
+            # we don't want to burn rng states that would misalign the terrain 
+            # generation between different seeds in deterministic vs stochastic modes.
+            force = pymunk.Vec2d(self.initial_random, self.initial_random)
+        else:
+            force = pymunk.Vec2d(
+                float(rng.uniform(-self.initial_random, self.initial_random)),
+                float(rng.uniform(-self.initial_random, self.initial_random)),
+            )
 
         # Box2D integrates this force before solving the reset frame. Applying
         # the equivalent one-frame impulse before Pymunk's step preserves the
@@ -497,7 +531,7 @@ class PymunkLunarLanderDemo:
         side = pymunk.Vec2d(-tip.y, tip.x)
 
         if dispersion is None:
-            dispersion = [self.rng.uniform(-1.0, +1.0) / SCALE for _ in range(2)]
+            dispersion = [self.rng.uniform(-1.0, +1.0) * self.dispersion_scale / SCALE for _ in range(2)]
 
         m_power = 1.0
 
@@ -514,8 +548,8 @@ class PymunkLunarLanderDemo:
         impulse_pos = origin + pymunk.Vec2d(ox, oy)
 
         impulse = pymunk.Vec2d(
-            -ox * MAIN_ENGINE_POWER * m_power,
-            -oy * MAIN_ENGINE_POWER * m_power,
+            -ox * self.main_engine_power * m_power,
+            -oy * self.main_engine_power * m_power,
         )
 
         self._record_engine_impulse("main", dispersion, impulse_pos, impulse)
@@ -536,7 +570,7 @@ class PymunkLunarLanderDemo:
         )
         side = pymunk.Vec2d(-tip.y, tip.x)
         if dispersion is None:
-            dispersion = [self.rng.uniform(-1.0, +1.0) / SCALE for _ in range(2)]
+            dispersion = [self.rng.uniform(-1.0, +1.0) * self.dispersion_scale / SCALE for _ in range(2)]
 
         s_power = 1.0
 
@@ -554,8 +588,8 @@ class PymunkLunarLanderDemo:
         )
 
         impulse = pymunk.Vec2d(
-            -ox * SIDE_ENGINE_POWER * s_power,
-            -oy * SIDE_ENGINE_POWER * s_power,
+            -ox * self.side_engine_power * s_power,
+            -oy * self.side_engine_power * s_power,
         )
 
         # print(
@@ -607,7 +641,7 @@ class PymunkLunarLanderDemo:
         self.last_engine_diagnostics = None
         # Box2D samples dispersion on every physics step, even when no engine
         # fires. Sampling here keeps matched-seed RNG progression identical.
-        dispersion = [self.rng.uniform(-1.0, +1.0) / SCALE for _ in range(2)]
+        dispersion = [self.rng.uniform(-1.0, +1.0) * self.dispersion_scale / SCALE for _ in range(2)]
         if action == 1:
             self.fire_orientation_engine(-1, dispersion)
         elif action == 2:
@@ -616,6 +650,37 @@ class PymunkLunarLanderDemo:
             self.fire_orientation_engine(1, dispersion)
         elif action != 0:
             raise ValueError("action must be one of 0, 1, 2, or 3")
+
+        # wind is only applied when the lander is completely airborne.
+        # applying wind while a leg is touching the ground causes severe 
+        # grinding against the terrain friction, which artificially inflates 
+        # the solver's impulse and leads to unrealistic sliding or tipping over.
+        if self.enable_wind and not self.crashed and not (self.left_leg_contact or self.right_leg_contact):
+            wind_mag = (
+                math.tanh(
+                    math.sin(0.02 * self.wind_idx)
+                    + (math.sin(math.pi * 0.01 * self.wind_idx))
+                )
+                * self.wind_power
+            )
+            self.wind_idx += 1
+            
+            # the wind force is purely translational and applies to the entire body.
+            # applying it to the center of mass in world coordinates guarantees that
+            # no parasitic torque is generated, maintaining parity with Box2D's 
+            # ApplyForceToCenter behavior.
+            self.lander_body.apply_force_at_world_point(
+                (wind_mag, 0.0), body_center_of_mass_world(self.lander_body)
+            )
+            
+            # turbulence is represented as a pure rotational force (torque).
+            # Box2D's ApplyTorque adds to the body's total torque for the step,
+            # which is functionally identical to Pymunk's body.torque += value.
+            torque_mag = math.tanh(
+                math.sin(0.02 * self.wind_idx)
+                + (math.sin(math.pi * 0.01 * self.wind_idx))
+            ) * (self.turbulence_power)
+            self.lander_body.torque += torque_mag
 
         self.space.step(DT)
         if self.last_engine_diagnostics is not None:
@@ -761,8 +826,24 @@ class ExperimentalPymunkLunarLanderEnv(GymEnv):
         self,
         render_mode: str | None = None,
         solver_iterations: int = 6 * 30,
+        deterministic: bool = False,
+        enable_wind: bool = False,
+        wind_power: float = 15.0,
+        turbulence_power: float = 1.5,
+        main_engine_power: float = 13.0,
+        side_engine_power: float = 0.6,
+        initial_random: float = 1000.0,
+        dispersion_scale: float = 1.0,
     ):
         """Create the unregistered experimental Pymunk LunarLander env."""
+        self.deterministic = deterministic
+        self.enable_wind = enable_wind
+        self.wind_power = wind_power
+        self.turbulence_power = turbulence_power
+        self.main_engine_power = main_engine_power
+        self.side_engine_power = side_engine_power
+        self.initial_random = initial_random
+        self.dispersion_scale = dispersion_scale
         if render_mode is not None and render_mode not in self.metadata["render_modes"]:
             raise ValueError(f"Unsupported render_mode: {render_mode}")
 
@@ -818,6 +899,14 @@ class ExperimentalPymunkLunarLanderEnv(GymEnv):
             rng=self.np_random,
             randomize_initial_state=True,
             solver_iterations=self.solver_iterations,
+            deterministic=self.deterministic,
+            enable_wind=self.enable_wind,
+            wind_power=self.wind_power,
+            turbulence_power=self.turbulence_power,
+            main_engine_power=self.main_engine_power,
+            side_engine_power=self.side_engine_power,
+            initial_random=self.initial_random,
+            dispersion_scale=self.dispersion_scale,
         )
         self.prev_shaping = None
 
@@ -1071,6 +1160,25 @@ class ExperimentalPymunkLunarLanderEnv(GymEnv):
         pygame.draw.line(surface, (40, 180, 80), helipad_start, helipad_end, width=4)
 
         self._draw_engine_flames(pygame, surface)
+
+        if self.demo.enable_wind and not self.demo.crashed:
+            wind_mag = (
+                math.tanh(
+                    math.sin(0.02 * self.demo.wind_idx)
+                    + (math.sin(math.pi * 0.01 * self.demo.wind_idx))
+                )
+                * self.demo.wind_power
+            )
+            # draw an arrow or lines showing wind direction
+            start_x = VIEWPORT_WIDTH // 2
+            start_y = 50
+            end_x = start_x + int(wind_mag * 5)
+            pygame.draw.line(surface, (100, 100, 255), (start_x, start_y), (end_x, start_y), 3)
+            # Draw arrow head
+            if wind_mag > 0:
+                pygame.draw.polygon(surface, (100, 100, 255), [(end_x, start_y), (end_x - 10, start_y - 5), (end_x - 10, start_y + 5)])
+            elif wind_mag < 0:
+                pygame.draw.polygon(surface, (100, 100, 255), [(end_x, start_y), (end_x + 10, start_y - 5), (end_x + 10, start_y + 5)])
 
         hull_points = self._body_poly_points(self.demo.lander_body)
         pygame.draw.polygon(surface, (128, 102, 230), hull_points)
